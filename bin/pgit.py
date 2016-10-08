@@ -116,21 +116,35 @@ def repo_graph(head_commits):
 def copy_repo(repo, copy_heads=['master']):
     """Copies the nodes in a repo_graph"""
 
-    branch_prefix = 'origin/'
+    tag_prefix = 'refs/tags/'
+    branch_prefix = 'refs/heads/'
+    branch_location_prefix = 'origin/'
 
-#    copy_head_commits = [repo.revparse_single(x) for x in copy_heads]
-    copy_head_commits = list()
+    # List of refs of the copy_heads
+    copy_head_refs = []
     for x in copy_heads:
-        ref = repo.lookup_branch(branch_prefix + x, pygit2.GIT_BRANCH_REMOTE)
+        ref = repo.lookup_branch(branch_location_prefix + x, pygit2.GIT_BRANCH_REMOTE)
         if ref is None:
             ref = repo.lookup_reference('refs/tags/' + x)
         if ref is None:
             raise ValueError('Cannot lookup {}'.format(x))
-        copy_head_commits.append(ref.get_object())
+        copy_head_refs.append(ref)
+    copy_head_commits = [ref.get_object() for ref in copy_head_refs]
 
-    rg = repo_graph(copy_head_commits)
+    # Set of OIDs that should NOT be collapsed: anything with a tag
+    # or a branch on it.
+    old_keep_ids = set([commit.id for commit in copy_head_commits])
+    for ref_name in repo.listall_references():
+        if ref_name.startswith(tag_prefix) or ref_name.startswith(branch_prefix):
+            id = repo.lookup_reference(ref_name).get_object().id
+            old_keep_ids.add(id)
+
+
+
+    rg = repo_graph([x.get_object() for x in copy_head_refs])
     starts = rg.orphans
 
+    # Translation from old commits to new commits
     old2new = dict()    # old id --> new commit
     for start in starts:
         old2new[start.id] = start
@@ -143,56 +157,41 @@ def copy_repo(repo, copy_heads=['master']):
         old_parents = rg.parents(old_child)
         new_parents = [old2new[rg.id(x)] for x in old_parents]
 
-#        print('old_parents', [x.id for x in old_parents])
-#        print('new_parents', [x.id for x in new_parents])
+        # Use the same tree as the old commit...
+        tree = old_child.tree
 
-#        print('old: {}'.format(commit2str(old_child)))
-        # http://www.pygit2.org/recipes/git-cherry-pick.html
+        # Remove everything but the lib folder...
+        tb = repo.TreeBuilder(tree)
+        for entry in tree:
+            if entry.name != 'lib':
+                tb.remove(entry.name)
+        new_tree_id = tb.write()
+
         branch = repo.create_branch('__pgit', new_parents[0], True)
-        repo.checkout(branch.name)
 
-        # Cherrypick single commits, re-do merges...
-        if len(old_parents) == 1:
-            repo.cherrypick(rg.id(old_child))
-        else:
-            print('MERGE')
-            for parent in new_parents:
-                repo.merge(rg.id(parent))
-
-        if repo.index.conflicts is not None:
-            raise ValueError('Conflicts', rg.id(old_child))
-
-        tree_id = repo.index.write_tree()
         committer = pygit2.Signature('Robot', 'elizabeth.fischer@columbia.edu')
         new_child_id = repo.create_commit(branch.name, old_child.author, old_child.committer,
-            'xfer from %s' % old_child.id, tree_id,
+            'xfer from %s' % old_child.id, new_tree_id,
             [x.id for x in new_parents])
         new_child = repo.get(new_child_id)
-        del branch    # Oudated, prevent accidental use
-        repo.state_cleanup()
 
-#        print('new_child', new_child)
         old2new[rg.id(old_child)] = new_child
-#        print('    --> %s' % commit2str(old_child))
 
 
 
     # Copy the branches
     for old_branch_str in repo.listall_branches(pygit2.GIT_BRANCH_REMOTE):    # local branches only
 
-        print('old_branch_str', old_branch_str)
-
-        if not old_branch_str.startswith(branch_prefix):
+        if not old_branch_str.startswith(branch_location_prefix):
             continue
-        old_branch_leaf = old_branch_str[len(branch_prefix):]
+
+        old_branch_leaf = old_branch_str[len(branch_location_prefix):]
         if old_branch_leaf == 'HEAD':
             continue
 
         # Be paranoid... don't copy again
         if old_branch_leaf.startswith('public/'):
             continue
-
-        print('old_branch_leaf', old_branch_leaf)
 
         old_branch = repo.lookup_branch(old_branch_str, pygit2.GIT_BRANCH_REMOTE)
         print('old_branch', old_branch)
@@ -206,18 +205,66 @@ def copy_repo(repo, copy_heads=['master']):
         repo.create_branch(new_branch_name, new_commit, True)
 
     # Copy the tags
+    # http://ben.straub.cc/2013/06/03/refs-tags-and-branching/
 #    for tag in repo.listall_references():
 #        print(tag)
 
-    tag_prefix = 'refs/tags/'
     for ref_name in  repo.listall_references():
+        print(ref_name)
         if not ref_name.startswith(tag_prefix):
             continue
-        tag_name = ref_name[len(tag_prefix):]
+        if ref_name.startswith(tag_prefix + 'public/'):
+            continue
 
-   regex = re.compile('^refs/tags')
-    for tag in filter(lambda r: regex.match(r), ):
-        print(tag)
+        old_tag_name = ref_name[len(tag_prefix):]
+        new_tag_name = 'public/' + old_tag_name
+
+
+        print('old_tag_name', old_tag_name)
+        print('ref_name', ref_name)
+        old_ref = repo.lookup_reference(ref_name)#.get_object()
+
+        try:
+            # Annotated tag
+            old_tag = old_ref.peel(pygit2.Tag)
+            old_target_id = old_tag.target
+        except ValueError:
+            # Non-annotated tag
+            old_target_id = old_ref.target
+            old_tag = None
+
+        if old_target_id not in old2new:
+            continue
+
+        # Lookup new_tag_name
+        try:
+            new_ref = repo.lookup_reference(tag_prefix + new_tag_name)
+        except KeyError:
+            new_ref = None
+
+        new_target_id = old2new[old_target_id].id
+        if new_ref is not None and new_ref.target != new_target_id:
+            print('Deleteing tag', new_ref.target)
+            new_ref.delete()
+            new_ref = None
+        if new_ref is None:
+            print('Creating tag...')
+
+            if old_tag is not None:
+                new_tagger = old_tag.tagger
+                new_message = old_tag.message
+                new_message = ''    # Clear it out
+            else:
+                new_tagger = pygit2.Signature('Robot', 'elizabeth.fischer@columbia.edu')
+                new_message = ''    # There never was a message
+
+            # Create annotated tag
+            new_ref = repo.create_tag(
+                new_tag_name,
+                new_target_id, pygit2.GIT_OBJ_COMMIT,
+                new_tagger, new_message)
+
+            print(new_tag_name)
 
 
 def main():
