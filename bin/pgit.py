@@ -6,6 +6,34 @@ import datetime
 import collections
 import re
 
+branch_location_prefix = 'origin/'
+
+
+
+# ----------------------------------------------
+class WormDict(dict):
+    def __init__(self, *args, eq_fn=lambda x, y : x == y, **kwargs):
+        self.eq = eq_fn
+
+#    def __init__(self, inp=None):
+#        if isinstance(inp,dict):
+#            super(Dict,self).__init__(inp)
+#        else:
+#            super(Dict,self).__init__()
+#            if isinstance(inp, (collections.Mapping, collections.Iterable)): 
+#                si = self.__setitem__
+#                for k,v in inp:
+#                    si(k,v)
+
+    def __setitem__(self, k, v):
+        try:
+            oldv = self.__getitem__(k)
+            if not self.eq(oldv, v):
+                raise ValueError("duplicate key '{0}' found".format(k))
+        except KeyError:
+            super().__setitem__(k,v)
+# ----------------------------------------------
+
 def commit2str(commit):
     stime = datetime.datetime.utcfromtimestamp(commit.commit_time).strftime('%Y-%m-%dT%H:%M:%SZ')
     return '{} {} {}'.format(str(commit.id)[:6], stime, commit.author.email)
@@ -31,7 +59,7 @@ def refs2commits(refs):
 
 class VisitOnce(object):
     """A yield_fn that remembers things that have been visited."""
-    def __init__(self, visited=None, id_fn = lambda x : x):
+    def __init__(self, visited=None, id_fn = lambda x : x.id):
         self.visited = dict() if visited is None else visited
         self.id = id_fn
 
@@ -43,6 +71,7 @@ class VisitOnce(object):
             self.visited[id] = x
             return True
 
+# -------------------------------------------------------
 # http://codereview.stackexchange.com/questions/78577/depth-first-search-in-python
 def dfs(starts, children_fn, yield_fn = lambda x : True):
     """Depth-first search"""
@@ -63,6 +92,21 @@ def bfs(starts, children_fn, yield_fn = lambda x : True):
         if yield_fn(vertex):
             yield vertex
             queue.extend(children_fn(vertex))
+# -------------------------------------------------------
+sourceRE = re.compile('source: (.*)?.*')
+def new_commit_sources(msg):
+    """Identify the old commits to which a new commit corresponds.
+    Returned in same order they are listed in, in the commit message.
+
+    msg:
+        The commit message for the new commit."""
+
+    for line in msg.split('\n'):
+        match = sourceRE.match(line)
+        if match is None: continue
+
+        yield pygit2.Oid(hex=match.group(1))
+# -------------------------------------------------------
 
 
 def commit_parents(commit):
@@ -113,23 +157,49 @@ def repo_graph(head_commits):
         parents_fn=lambda commit : commit.parents,
         id_fn = lambda commit : commit.id)
 
+def get_head_commits(repo, heads, branch_namespace='refs/heads', raise_error=True):
+    """Gets the commits corresponding to a user-supplied list of heads
+    (eg: ['master', 'develop', etc]
+
+    branch_namespace:
+        Prepend this when looking for a branch"""
+
+    refs = []
+    for x in heads:
+        ref = repo.lookup_reference(branch_namespace + x)
+        # ref = repo.lookup_branch(branch_location_prefix + x, pygit2.GIT_BRANCH_REMOTE)
+        if ref is None:
+            ref = repo.lookup_reference('refs/tags/' + x)
+        if ref is None:
+            if raise_error:
+                raise ValueError('Cannot lookup {}'.format(x))
+            else:
+                continue
+        refs.append(ref)
+    commits = [ref.get_object() for ref in refs]
+    return commits
+
 def copy_repo(repo, copy_heads=['master']):
     """Copies the nodes in a repo_graph"""
 
     tag_prefix = 'refs/tags/'
     branch_prefix = 'refs/heads/'
-    branch_location_prefix = 'origin/'
 
-    # List of refs of the copy_heads
-    copy_head_refs = []
-    for x in copy_heads:
-        ref = repo.lookup_branch(branch_location_prefix + x, pygit2.GIT_BRANCH_REMOTE)
-        if ref is None:
-            ref = repo.lookup_reference('refs/tags/' + x)
-        if ref is None:
-            raise ValueError('Cannot lookup {}'.format(x))
-        copy_head_refs.append(ref)
-    copy_head_commits = [ref.get_object() for ref in copy_head_refs]
+    # -----------------------------------------
+    # Look up existing correspondence between old and new commits
+    old2new = WormDict(eq_fn = lambda x,y: x.id == y.id)    # old id --> new commit
+
+    new_copy_head_commits = get_head_commits(
+        repo, copy_heads, raise_error=False,
+        branch_namespace='refs/heads/public/')
+    for new_commit in dfs(new_copy_head_commits, commit_parents, VisitOnce()):
+        for old_id in new_commit_sources(new_commit.message):
+            old2new[old_id] = new_commit
+    # -----------------------------------------
+
+    # Get the commits corresponding to the copy_heads:
+    copy_head_commits = get_head_commits(repo, copy_heads,
+        branch_namespace='refs/remotes/origin/')
 
     # Set of OIDs that should NOT be collapsed: anything with a tag
     # or a branch on it.
@@ -141,16 +211,17 @@ def copy_repo(repo, copy_heads=['master']):
 
 
 
-    rg = repo_graph([x.get_object() for x in copy_head_refs])
+    rg = repo_graph(copy_head_commits)
     starts = rg.orphans
 
     # Translation from old commits to new commits
-    old2new = dict()    # old id --> new commit
     for start in starts:
-        old2new[start.id] = start
+        old2new[start.id] = start    # Share the orphans
     visited = dict()
     for old_child in bfs(starts, rg.children, VisitOnce(visited, id_fn=rg.id)):
         repo.checkout(repo.lookup_branch('develop').name)
+
+        # Don't transfer nodes already transferred.
         if rg.id(old_child) in old2new.keys():
             continue
 
@@ -167,14 +238,15 @@ def copy_repo(repo, copy_heads=['master']):
                 tb.remove(entry.name)
         new_tree_id = tb.write()
 
-        branch = repo.create_branch('__pgit', new_parents[0], True)
+#        branch = repo.create_branch('__pgit', new_parents[0], True)
 
         committer = pygit2.Signature('Robot', 'elizabeth.fischer@columbia.edu')
         new_child_id = repo.create_commit(branch.name, old_child.author, old_child.committer,
-            'xfer from %s' % old_child.id, new_tree_id,
+            'source: %s' % old_child.id, new_tree_id,
             [x.id for x in new_parents])
         new_child = repo.get(new_child_id)
 
+        print('Copied node: {} -> {}'.format(old_child.id, new_child.id))
         old2new[rg.id(old_child)] = new_child
 
 
@@ -280,208 +352,5 @@ def main():
     repo = pygit2.Repository('/home2/rpfische/tmp/modele-control')
 
     copy_repo(repo, copy_branch_strs)
-    sys.exit(0)
-
-
-#    rg = repo_graph([repo.lookup_branch(x) for x in copy_branch_strs])
-
-
-#    # commit 2d109f602826102123b0c9a9464b2350473541b9
-#    # Author: Tom <Thomas.L.Clune@nasa.gov>
-#    # Date:   Fri Jan 7 11:09:42 2011 -0500
-#    starts = [repo.get('2d109f602826102123b0c9a9464b2350473541b9')]
-
-
-    print(len(rg.commits))
-    common_ancestor = rg.orphans[0]    # Should always be the Ur commit
-    src_parent = common_ancestor
-    src = rg.children(src_parent)[0]
-    out_branch = repo.create_branch('_out', common_ancestor, True)
-
-    index = repo.merge_trees(common_ancestor.tree, out_branch, src, favor='theirs')
-    tree_id = index.write_tree(repo)
-    repo.create_commit(out_branch.name,
-        pygit2.Signature('Archimedes', 'archy@jpl-classics.org'),
-        pygit2.Signature('Archimedes', 'archy@jpl-classics.org'),
-        'Obtained from other', tree_id, [src_parent.id])
-
-
-#    print(rg.children(base))
-#    print(commit2str(base))
-    sys.exit(0)
-
-
-
-    base = 'e1f59f3d10a64a44183b8241cce4fc7620c8cd8b'
-
-
-
-    refs = []
-    refs.append(repo.lookup_reference('refs/heads/master'))
-    refs.append(repo.lookup_branch('master'))
-    refs.append(repo.lookup_reference('HEAD'))
-    print([x.get_object().id for x in refs])
-    sys.exit(0)
-
-    ref = repo.lookup_reference("refs/heads/master")
-    commit = master_ref.get_object() # or repo[master_ref.target]
-    start = commit.parent[0]
-
-
-#e1f59f3d10a64a44183b8241cce4fc7620c8cd8b
-#
-#
-#    src_parent = 
-#
-#cherry = repo.revparse_single('9e044d03c')
-#basket = repo.lookup_branch('basket')
-#
-#base      = repo.merge_base(cherry.oid, basket.target)
-#base_tree = cherry.parents[0].tree
-#
-#index = repo.merge_trees(base_tree, basket, cherry)
-#tree_id = index.write_tree(repo)
-#
-#author    = cherry.author
-#committer = pygit2.Signature('Archimedes', 'archy@jpl-classics.org')
-#
-#repo.create_commit(basket.name, author, committer, cherry.message,
-#                   tree_id, [basket.target])
-
-
-
-
-    sys.exit(0)
-
-    rg = repo_graph(all_refs_prefix(repo))
-    for commit in rg.orphans:
-        print(commit2str(commit))
-    print(len(rg.commits))
 
 main()
-
-
-
-
-
-
-
-#        # Get initial Commits based on all the heads
-#        initial_commits = refs2commits(heads)
-#
-#        # Trace them back...
-#        stack = [x for x in initial_commits.values()]
-#        while len(stack) > 0:
-#            commit = stack.pop()
-#            if commit.id in self.commits:
-#                continue
-#
-#            self.commits[commit.id] = commit
-#            if len(commit.parents) == 0:
-#                self.orphans.append(commit)
-#            else:
-#                for parent in commit.parents:
-#                    self._children[parent.id] = commit
-#                    if parent.id not in self.commits:
-#                        stack.append(parent)
-
-
-
-
-
-
-#class RepoGraph(object):
-#
-#    @property
-#    def parents(self, commit):
-#        return commit.parents
-#
-#    @property
-#    def children(self, commmit):
-#        return self.children(commit.id)
-#
-#    def __init__(self, heads):
-#        self.commits = dict()        # id --> commit
-#        self._children = defaultdict(list)    # id --> commit's children
-#        self.orphans = list()
-#
-#
-#        # Get initial Commits based on all the heads
-#        initial_commits = refs2commits(heads)
-#
-#        # Trace them back...
-#        stack = [x for x in initial_commits.values()]
-#        while len(stack) > 0:
-#            commit = stack.pop()
-#            if commit.id in self.commits:
-#                continue
-#
-#            self.commits[commit.id] = commit
-#            if len(commit.parents) == 0:
-#                self.orphans.append(commit)
-#            else:
-#                for parent in commit.parents:
-#                    self._children[parent.id] = commit
-#                    if parent.id not in self.commits:
-#                        stack.append(parent)
-#
-#
-#
-#
-#
-##walker = repo.walk(master_commit.id, pygit2.GIT_SORT_TOPOLOGICAL)
-#print(sum(1 for _ in walker))
-#
-#
-#
-##for commit in repo.walk(commit.id, pygit2.GIT_SORT_TOPOLOGICAL):
-##    print(str(commit.oid)[:10], commit.message)
-#
-##print(commit.oid)
-##print(commit.message)
-##print(commit.author.name)
-##print(commit.author.email)
-##print(commit.parents)
-#
-##refs/heads/master
-#
-#
-#
-#all_refs = repo.listall_references()
-#
-#print('\n'.join(all_refs))
-#
-#sys.exit(0)
-#master_ref = repo.lookup_reference("refs/heads/master")
-#master_commit = master_ref.get_object() # or repo[master_ref.target]
-#
-#commits = dict()        # id --> commit
-#children = defaultdict(list)    # id --> commit's children
-#
-#
-#stack = list()
-#stack.append(master_commit)
-#
-#while len(stack) > 0:
-#    commit = stack.pop()
-#    if commit.id not in commits:
-#        commits[commit.id] = commit
-#        for parent in commit.parents:
-#            children[parent.id] = commit
-#            if parent.id not in commits:
-#                stack.append(parent)
-#
-#print(len(commits))
-#print(len(children))
-#for commit in commits.values():
-#    if len(commit.parents) == 0:
-#        print(commit.oid)
-#        print(commit.message)
-#        print(commit.author.name)
-#        print(commit.author.email)
-#        
-#
-##children[commit.parents[0].oid] = commit
-##print(children)
-##commit = commit.parents[0]
-#
