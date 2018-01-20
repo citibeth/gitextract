@@ -5,10 +5,23 @@ import sys
 import datetime
 import collections
 import re
+import configparser
+import contextlib
+import subprocess
 
 branch_location_prefix = 'origin/'
 
 
+@contextlib.contextmanager
+def pushd(path):
+    """A context manager which changes the working directory to the given
+    path, and then changes it back to its previous value on exit.
+
+    """
+    prev_cwd = os.getcwd()
+    os.chdir(path)
+    yield
+    os.chdir(prev_cwd)
 
 # ----------------------------------------------
 class WormDict(dict):
@@ -70,6 +83,30 @@ class VisitOnce(object):
         else:
             self.visited[id] = x
             return True
+
+class TopoSortVisited(object):
+    """A yield_fn that allows a node to be visited ONLY once all its
+    parents have been visited."""
+
+    def __init__(self, visited=None, id_fn = lambda x : x.id, parents_fn=None):
+        self.visited = dict() if visited is None else visited
+        self.id = id_fn
+        self.parents = parents_fn
+
+    def __call__(self, node):
+        id = self.id(node)
+        if id in self.visited:
+            return False
+
+        # Make sure all parents have been visited
+        for parent in self.parents(node):
+            if self.id(parent) not in self.visited:
+                return False
+
+        # Visit this node!
+        self.visited[id] = node
+        return True
+
 
 # -------------------------------------------------------
 # http://codereview.stackexchange.com/questions/78577/depth-first-search-in-python
@@ -166,20 +203,22 @@ def get_head_commits(repo, heads, branch_namespace='refs/heads', raise_error=Tru
 
     refs = []
     for x in heads:
-        ref = repo.lookup_reference(branch_namespace + x)
-        # ref = repo.lookup_branch(branch_location_prefix + x, pygit2.GIT_BRANCH_REMOTE)
-        if ref is None:
-            ref = repo.lookup_reference('refs/tags/' + x)
-        if ref is None:
-            if raise_error:
-                raise ValueError('Cannot lookup {}'.format(x))
-            else:
-                continue
+        ref = None
+        try:
+            ref = repo.lookup_reference(branch_namespace + x)
+        except KeyError:
+            try:
+                ref = repo.lookup_reference('refs/tags/' + x)
+            except KeyError:
+                if raise_error:
+                    raise ValueError('Cannot lookup {}'.format(x))
+                else:
+                    continue
         refs.append(ref)
     commits = [ref.get_object() for ref in refs]
     return commits
 
-def copy_repo(repo, copy_heads=['master']):
+def copy_repo(repo, copy_heads=['master'], overwrite=False):
     """Copies the nodes in a repo_graph"""
 
     tag_prefix = 'refs/tags/'
@@ -189,12 +228,16 @@ def copy_repo(repo, copy_heads=['master']):
     # Look up existing correspondence between old and new commits
     old2new = WormDict(eq_fn = lambda x,y: x.id == y.id)    # old id --> new commit
 
-    new_copy_head_commits = get_head_commits(
-        repo, copy_heads, raise_error=False,
-        branch_namespace='refs/heads/public/')
-    for new_commit in dfs(new_copy_head_commits, commit_parents, VisitOnce()):
-        for old_id in new_commit_sources(new_commit.message):
-            old2new[old_id] = new_commit
+    if not overwrite:
+        new_copy_head_commits = get_head_commits(
+            repo, copy_heads, raise_error=False,
+            branch_namespace='refs/heads/public/')
+        for new_commit in dfs(new_copy_head_commits, commit_parents, VisitOnce()):
+            for old_id in new_commit_sources(new_commit.message):
+                old2new[old_id] = new_commit
+                print('old2new: {} -> {}'.format(old_id, new_commit.id))
+
+    print('Initialized old2new with {} mappings'.format(len(old2new)))
     # -----------------------------------------
 
     # Get the commits corresponding to the copy_heads:
@@ -217,38 +260,69 @@ def copy_repo(repo, copy_heads=['master']):
     # Translation from old commits to new commits
     for start in starts:
         old2new[start.id] = start    # Share the orphans
+        print('old2new: {} -> {}'.format(start.id, start.id))
     visited = dict()
-    for old_child in bfs(starts, rg.children, VisitOnce(visited, id_fn=rg.id)):
-        repo.checkout(repo.lookup_branch('develop').name)
+    # Record of which old IDs are being squashed into which
+    squash = defaultdict(list)   # old_id -> {old_id's ancestors}
 
-        # Don't transfer nodes already transferred.
-        if rg.id(old_child) in old2new.keys():
-            continue
+    for old_child in dfs(starts, rg.children,
+        TopoSortVisited(visited, id_fn=rg.id, parents_fn=rg.parents)):
 
-        old_parents = rg.parents(old_child)
-        new_parents = [old2new[rg.id(x)] for x in old_parents]
+            old_id = rg.id(old_child)
+            repo.checkout(repo.lookup_branch(copy_heads[0]).name)
 
-        # Use the same tree as the old commit...
-        tree = old_child.tree
+            # Don't transfer nodes already transferred.
+            if old_id in old2new:
+                print('Reused node: {} -> {}'.format(old_id, rg.id(old2new[old_id])))
+                continue
 
-        # Remove everything but the lib folder...
-        tb = repo.TreeBuilder(tree)
-        for entry in tree:
-            if entry.name != 'lib':
-                tb.remove(entry.name)
-        new_tree_id = tb.write()
+            # Squash commits
+            squash[old_id].append(old_child)
+            if False and len(rg.parents(old_child)) < 2 and \
+                len(rg.children(old_child)) == 1 and \
+                old_id not in old_keep_ids:
 
-#        branch = repo.create_branch('__pgit', new_parents[0], True)
+                print('squashing', old_id)
 
-        committer = pygit2.Signature('Robot', 'elizabeth.fischer@columbia.edu')
-        new_child_id = repo.create_commit(branch.name, old_child.author, old_child.committer,
-            'source: %s' % old_child.id, new_tree_id,
-            [x.id for x in new_parents])
-        new_child = repo.get(new_child_id)
+                # Squash into our children
+                old_grandchild = rg.children(old_child)[0]
+                squash[rg.id(old_grandchild)] = squash[old_id]
+                del squash[old_id]
 
-        print('Copied node: {} -> {}'.format(old_child.id, new_child.id))
-        old2new[rg.id(old_child)] = new_child
+                continue    # Don't transfer this node
 
+            old_parents = rg.parents(squash[old_id][0])
+            new_parents = [old2new[rg.id(x)] for x in old_parents]
+
+            # Use the same tree as the old commit...
+            tree = old_child.tree
+
+            # Remove everything but the lib folder...
+            if False:
+                tb = repo.TreeBuilder(tree)
+                for entry in tree:
+                    if entry.name != 'lib':
+                        tb.remove(entry.name)
+                new_tree_id = tb.write()
+            else:
+                new_tree_id = tree.id
+
+            branch = repo.create_branch('__pgit', new_parents[0], True)
+
+            # List of things we're squashing into this new_commit
+            msg_lines = list()
+            for x in reversed(squash[old_id]):
+                msg_lines.append('source: %s' % rg.id(x))
+
+            committer = pygit2.Signature('Robot', 'elizabeth.fischer@columbia.edu')
+            new_child_id = repo.create_commit(branch.name, old_child.author, old_child.committer,
+                '\n'.join(msg_lines), new_tree_id,
+                [x.id for x in new_parents])
+            new_child = repo.get(new_child_id)
+
+            print('Copied node: {} -> {}'.format(old_child.id, new_child.id))
+            for x in squash[old_id]:
+                old2new[rg.id(x)] = new_child
 
 
     # Copy the branches
@@ -281,6 +355,7 @@ def copy_repo(repo, copy_heads=['master']):
 #    for tag in repo.listall_references():
 #        print(tag)
 
+    new_tags = list()    # Tags we've created
     for ref_name in  repo.listall_references():
         print(ref_name)
         if not ref_name.startswith(tag_prefix):
@@ -290,7 +365,6 @@ def copy_repo(repo, copy_heads=['master']):
 
         old_tag_name = ref_name[len(tag_prefix):]
         new_tag_name = 'public/' + old_tag_name
-
 
         print('old_tag_name', old_tag_name)
         print('ref_name', ref_name)
@@ -338,6 +412,15 @@ def copy_repo(repo, copy_heads=['master']):
 
             print(new_tag_name)
 
+        new_tags.append(new_tag_name)
+
+    # Push the public version of all the branches we copied
+    # public_remote = repo.remotes['public']
+    # _pygit2.GitError: Local push doesn't (yet) support pushing to non-bare repos.
+    #public_remote.push(['refs/heads/public/' + x for x in copy_heads])
+    with pushd(repo.path):
+        cmd = ['git', 'push', '-f', 'public'] + ['public/' + x for x in copy_heads] + ['refs/tags/{0}:refs/tags/{0}'.format(x) for x in new_tags]
+        subprocess.call(cmd)
 
 def main():
 #    repo = pygit2.Repository('/home2/rpfische/tmp/modelE')
@@ -348,9 +431,20 @@ def main():
 
     # Get a list of all refs we're interested in.
 #    copy_branch_strs = ['AR5', 'AR5_v2', 'ModelE1-patches', 'develop', 'planet']
-    copy_branch_strs = ['_tmp', 'develop', 'docs', 'samplemerge']
-    repo = pygit2.Repository('/home2/rpfische/tmp/modele-control')
 
-    copy_repo(repo, copy_branch_strs)
+    extract_dir = os.path.abspath(sys.argv[1])
+    mixer_dir = os.path.join(extract_dir, 'mixer')
+
+    config = configparser.ConfigParser()
+    config.read(os.path.join(extract_dir, 'config.ini'))
+
+    branches = [x.strip() for x in config['DEFAULT']['branches'].split(',')]
+    overwrite = (config['DEFAULT']['overwrite'] == 'yes')
+
+
+#    branches = ['_tmp', 'develop', 'docs', 'samplemerge']
+    print('Opening repo', mixer_dir)
+    repo = pygit2.Repository(mixer_dir)
+    copy_repo(repo, branches, overwrite=overwrite)
 
 main()
